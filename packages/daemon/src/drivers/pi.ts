@@ -9,6 +9,9 @@ import path from "node:path";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   getAgentDir,
   DefaultPackageManager,
   ModelRegistry,
@@ -1605,7 +1608,16 @@ export async function createPiAgentSessionForContext(
           resourceLoaderOptions: {
             additionalExtensionPaths: localExtensionPaths,
             // Keeps an oversized compaction request inside the model limit (task #10).
-            extensionFactories: [createPiCompactionFitExtension()],
+            extensionFactories: [
+              createPiCompactionFitExtension(),
+              // The embedded SDK does not install the CLI's built-in extensions.
+              // Pi inherits local MCP configuration; Built-in keeps host isolation.
+              ...(runtimeConfig.runtime === "pi" ? [
+                { name: "codemode", factory: createCodemodeExtension(), replaceable: true, builtin: true } as const,
+                { name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true } as const,
+                { name: "mcp", factory: createMcpExtension(), replaceable: true, builtin: true } as const,
+              ] : []),
+            ],
             systemPromptOverride: () => ctx.standingPrompt,
           },
         });
@@ -1762,12 +1774,19 @@ export async function createPiAgentSessionForContext(
       }
     };
 
-    if (runtimeConfig.runtime === "builtin" && runtimeConfig.loadLocalPlugins === true) {
+    if (runtimeConfig.runtime === "pi"
+      || (runtimeConfig.runtime === "builtin" && runtimeConfig.loadLocalPlugins === true)) {
       try {
         // Complete the SDK extension lifecycle, including session_start hooks.
         await session.bindExtensions({ mode: "rpc" });
       } catch (error) {
-        session.dispose();
+        try {
+          await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        } catch {
+          // Preserve the original startup error while releasing partial transports.
+        } finally {
+          session.dispose();
+        }
         throw error;
       }
     }
@@ -2344,9 +2363,17 @@ export class PiSdkRuntimeSession implements RuntimeSession {
     const session = this.session;
     this.session = null;
     try {
-      session?.dispose();
+      // SDK dispose() does not emit session_shutdown. MCP uses this event to
+      // close transports (including local stdio child processes) before exit.
+      await session?.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     } catch (error) {
       this.events.emit("stderr", piErrorMessage(error));
+    } finally {
+      try {
+        session?.dispose();
+      } catch (error) {
+        this.events.emit("stderr", piErrorMessage(error));
+      }
     }
   }
 

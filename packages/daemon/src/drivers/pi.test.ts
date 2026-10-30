@@ -316,6 +316,79 @@ test("createPiAgentSessionForContext resolves explicit Pi package extension mode
   }
 });
 
+test("Pi starts local MCP extensions for direct and indirect tool exposure", { timeout: 30_000 }, async () => {
+  const fixture = createPiExtensionModelFixture(onTestFinished);
+  const serverPath = path.join(fixture.root, "mcp-probe.cjs");
+  // A real stdio transport: no external server, account or model request.
+  writeFileSync(serverPath, `
+const { createInterface } = require("node:readline");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  let result;
+  switch (request.method) {
+    case "initialize": result = { protocolVersion: request.params.protocolVersion,
+      capabilities: { tools: {} }, serverInfo: { name: "probe", version: "1" } }; break;
+    case "tools/list": result = { tools: [{ name: "echo", description: "Read-only probe",
+      inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }] }; break;
+    case "tools/call": result = { content: [{ type: "text", text: request.params.arguments.text }] }; break;
+    default: result = {};
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");
+});
+`);
+  await withPiExtensionEnv(fixture, async () => {
+    for (const exposure of ["direct", "codemode", "deferred"] as const) {
+      writeFileSync(path.join(fixture.agentDir, "mcp.json"), JSON.stringify({
+        mcpServers: { probe: { command: process.execPath, args: [serverPath], exposure } },
+      }));
+      const session = await createPiAgentSessionForContext(
+        makeSpawnContext({ model: fixture.modelId }, { workingDirectory: fixture.root }),
+        `mcp-${exposure}`,
+      );
+      try {
+        await waitForState(() => session.getCallableToolNames().includes("mcp__probe__echo"),
+          `local MCP ${exposure} tool registration`, { timeoutMs: 2_000 });
+        assert.equal(session.getActiveToolNames().includes("mcp__probe__echo"), exposure === "direct");
+        if (exposure !== "direct") {
+          assert.ok(session.getActiveToolNames().includes(exposure === "codemode" ? "codemode" : "tool_search"));
+        }
+        const tool = session.getToolDefinition("mcp__probe__echo");
+        assert.ok(tool);
+        const result = await tool.execute("probe-call", { text: "local-mcp-ok" }, undefined, undefined,
+          {} as Parameters<typeof tool.execute>[4]);
+        assert.deepEqual(result.content, [{ type: "text", text: "local-mcp-ok" }]);
+      } finally {
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        session.dispose();
+      }
+    }
+  });
+});
+
+test("Pi headless MCP config errors do not fail startup or discard local skills", async () => {
+  const fixture = createPiExtensionModelFixture(onTestFinished);
+  const skillDir = path.join(fixture.agentDir, "skills", "mcp-probe-skill");
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(path.join(skillDir, "SKILL.md"),
+    "---\nname: mcp-probe-skill\ndescription: Retained after extension startup\n---\nRead-only probe.\n");
+  // Config loading reports this through ctx.ui.notify during session_start.
+  writeFileSync(path.join(fixture.agentDir, "mcp.json"), "{ malformed JSON");
+  await withPiExtensionEnv(fixture, async () => {
+    const session = await createPiAgentSessionForContext(
+      makeSpawnContext({ model: fixture.modelId }, { workingDirectory: fixture.root }), "mcp-config-error",
+    );
+    try {
+      assert.ok(session.resourceLoader.getSkills().skills.some((skill) => skill.name === "mcp-probe-skill"));
+      assert.ok(session.getActiveToolNames().includes("read"));
+      assert.equal(session.getCallableToolNames().some((name) => name.startsWith("mcp__")), false);
+    } finally {
+      await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      session.dispose();
+    }
+  });
+});
+
 test("createPiAgentSessionForContext persists an early startup failure without a native transcript", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "pi-startup-failure-"));
   const workingDirectory = path.join(root, "workspace");
@@ -2395,6 +2468,28 @@ test("driver enables Pi SDK compaction so compaction lifecycle events can surfac
   );
 });
 
+test("Pi runtime waits for extension shutdown before disposing the SDK session", async () => {
+  const calls: string[] = [];
+  const fake = createFakeAgentSession("mcp-cleanup", calls);
+  const runtime = new PiSdkRuntimeSession(makeSpawnContext(), () => undefined, async () => ({
+    ...fake,
+    extensionRunner: {
+      async emit(event: { type: string; reason: string }) {
+        assert.deepEqual(event, { type: "session_shutdown", reason: "quit" });
+        await new Promise((resolve) => setImmediate(resolve));
+        calls.push("mcp-transports-closed");
+      },
+    },
+  }) as unknown as AgentSession);
+  await runtime.start({ text: "initial" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await runtime.dispose();
+  assert.ok(calls.indexOf("mcp-transports-closed") >= 0);
+  assert.ok(calls.indexOf("mcp-transports-closed") < calls.indexOf("dispose"));
+  await runtime.dispose();
+  assert.equal(calls.filter((call) => call === "mcp-transports-closed").length, 1);
+});
+
 test("PiSdkRuntimeSession subscribes before prompt and routes prompt, steer, and stop through SDK APIs", async () => {
   const calls: string[] = [];
   const events: ParsedEvent[] = [];
@@ -3743,6 +3838,7 @@ function createFakeAgentSession(sessionId: string, calls: string[], options?: { 
   let streaming = false;
   return {
     sessionId,
+    extensionRunner: { async emit() {} },
     get isStreaming() {
       return streaming;
     },
